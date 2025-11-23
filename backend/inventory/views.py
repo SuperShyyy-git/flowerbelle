@@ -6,6 +6,8 @@ from django.db.models import Sum, F, Q
 from django.utils import timezone
 from accounts.permissions import IsOwner, IsOwnerOrReadOnly
 from accounts.utils import create_audit_log
+from django.db import IntegrityError 
+from rest_framework import serializers 
 from .models import Category, Supplier, Product, InventoryMovement, LowStockAlert
 from .serializers import (
     CategorySerializer, SupplierSerializer,
@@ -19,7 +21,7 @@ from .serializers import (
 
 class CategoryListCreateView(generics.ListCreateAPIView):
     """List all categories or create a new one"""
-    queryset = Category.objects.all()
+    queryset = Category.objects.filter(is_active=True)
     serializer_class = CategorySerializer
     permission_classes = [IsAuthenticated, IsOwnerOrReadOnly]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
@@ -76,7 +78,8 @@ class CategoryDetailView(generics.RetrieveUpdateDestroyAPIView):
 
 class SupplierListCreateView(generics.ListCreateAPIView):
     """List all suppliers or create a new one"""
-    queryset = Supplier.objects.all()
+    # Only active suppliers are shown
+    queryset = Supplier.objects.filter(is_active=True)
     serializer_class = SupplierSerializer
     permission_classes = [IsAuthenticated, IsOwnerOrReadOnly]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
@@ -139,23 +142,34 @@ class ProductListCreateView(generics.ListCreateAPIView):
     ordering_fields = ['name', 'unit_price', 'current_stock', 'created_at']
     ordering = ['name']
     
+    # 👇 THIS DISABLES PAGINATION SO YOU SEE ALL PRODUCTS 👇
+    pagination_class = None 
+    
     def get_queryset(self):
-        queryset = Product.objects.select_related('category', 'supplier').all()
+        # Start with only ACTIVE products by default
+        queryset = Product.objects.filter(is_active=True).select_related('category', 'supplier')
         
         # Filter by category
-        category_id = self.request.query_params.get('category')
-        if category_id:
-            queryset = queryset.filter(category_id=category_id)
+        category_param = self.request.query_params.get('category')
+        if category_param:
+            try:
+                category_id = int(category_param)
+                queryset = queryset.filter(category_id=category_id)
+            except (ValueError, TypeError):
+                pass # Ignore invalid category
         
         # Filter by low stock
         low_stock = self.request.query_params.get('low_stock')
         if low_stock == 'true':
             queryset = queryset.filter(current_stock__lte=F('reorder_level'))
         
-        # Filter by active status
+        # Filter by active status override
         is_active = self.request.query_params.get('is_active')
         if is_active is not None:
-            queryset = queryset.filter(is_active=is_active.lower() == 'true')
+            if is_active.lower() == 'false':
+                queryset = Product.objects.filter(is_active=False).select_related('category', 'supplier')
+            elif is_active.lower() == 'true':
+                queryset = Product.objects.filter(is_active=True).select_related('category', 'supplier')
         
         return queryset
     
@@ -165,15 +179,32 @@ class ProductListCreateView(generics.ListCreateAPIView):
         return ProductListSerializer
     
     def perform_create(self, serializer):
-        product = serializer.save(created_by=self.request.user)
-        create_audit_log(
-            user=self.request.user,
-            action='CREATE',
-            table_name='products',
-            record_id=product.id,
-            new_values=ProductDetailSerializer(product).data,
-            request=self.request
-        )
+        try:
+            product = serializer.save(created_by=self.request.user)
+            
+            try:
+                create_audit_log(
+                    user=self.request.user,
+                    action='CREATE',
+                    table_name='products',
+                    record_id=product.id,
+                    new_values=ProductDetailSerializer(product).data,
+                    request=self.request
+                )
+            except Exception as audit_e:
+                print(f"AUDIT LOG FAILED: {audit_e}")
+            
+        except IntegrityError as e:
+            error_message = str(e).lower()
+            if 'unique' in error_message and 'sku' in error_message:
+                raise serializers.ValidationError(
+                    {"sku": "A product with this SKU already exists. Please choose a unique SKU."}, 
+                    code='unique'
+                )
+            raise
+        except Exception as e:
+            print(f"CRITICAL SERVER ERROR: {e}")
+            raise
 
 
 class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -187,20 +218,36 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
         return ProductDetailSerializer
     
     def perform_update(self, serializer):
-        old_data = ProductDetailSerializer(self.get_object()).data
-        product = serializer.save()
-        create_audit_log(
-            user=self.request.user,
-            action='UPDATE',
-            table_name='products',
-            record_id=product.id,
-            old_values=old_data,
-            new_values=ProductDetailSerializer(product).data,
-            request=self.request
-        )
+        try:
+            old_data = ProductDetailSerializer(self.get_object()).data
+            product = serializer.save()
+            
+            try:
+                create_audit_log(
+                    user=self.request.user,
+                    action='UPDATE',
+                    table_name='products',
+                    record_id=product.id,
+                    old_values=old_data,
+                    new_values=ProductDetailSerializer(product).data,
+                    request=self.request
+                )
+            except Exception as audit_e:
+                print(f"AUDIT LOG FAILED: {audit_e}")
+
+        except IntegrityError as e:
+            error_message = str(e).lower()
+            if 'unique' in error_message and 'sku' in error_message:
+                raise serializers.ValidationError(
+                    {"sku": "A product with this SKU already exists. Please choose a unique SKU."}, 
+                    code='unique'
+                )
+            raise
+        except Exception as e:
+            print(f"CRITICAL SERVER ERROR: {e}")
+            raise
     
     def perform_destroy(self, instance):
-        # Soft delete
         instance.is_active = False
         instance.save()
         create_audit_log(
@@ -226,17 +273,14 @@ class InventoryMovementListCreateView(generics.ListCreateAPIView):
     def get_queryset(self):
         queryset = InventoryMovement.objects.select_related('product', 'created_by').all()
         
-        # Filter by product
         product_id = self.request.query_params.get('product')
         if product_id:
             queryset = queryset.filter(product_id=product_id)
         
-        # Filter by movement type
         movement_type = self.request.query_params.get('movement_type')
         if movement_type:
             queryset = queryset.filter(movement_type=movement_type)
         
-        # Filter by date range
         start_date = self.request.query_params.get('start_date')
         end_date = self.request.query_params.get('end_date')
         if start_date:
@@ -254,10 +298,8 @@ class InventoryMovementListCreateView(generics.ListCreateAPIView):
     def perform_create(self, serializer):
         movement = serializer.save(created_by=self.request.user)
         
-        # Check if product is now low stock and create alert
         product = movement.product
         if product.is_low_stock:
-            # Check if there's already a pending alert
             existing_alert = LowStockAlert.objects.filter(
                 product=product,
                 status='PENDING'
@@ -300,7 +342,6 @@ class StockAdjustmentView(APIView):
         reason = serializer.validated_data['reason']
         notes = serializer.validated_data.get('notes', '')
         
-        # Create inventory movement
         movement = InventoryMovement.objects.create(
             product=product,
             movement_type='ADJUSTMENT',
@@ -340,7 +381,6 @@ class LowStockAlertListView(generics.ListAPIView):
     def get_queryset(self):
         queryset = LowStockAlert.objects.select_related('product', 'acknowledged_by').all()
         
-        # Filter by status
         status_filter = self.request.query_params.get('status')
         if status_filter:
             queryset = queryset.filter(status=status_filter)
@@ -416,16 +456,13 @@ class InventoryReportView(APIView):
     permission_classes = [IsAuthenticated]
     
     def get(self, request):
-        # Total products stats
         total_products = Product.objects.count()
         active_products = Product.objects.filter(is_active=True).count()
         
-        # Stock value
         total_stock_value = Product.objects.aggregate(
             total=Sum(F('current_stock') * F('cost_price'))
         )['total'] or 0
         
-        # Low stock and out of stock
         low_stock_count = Product.objects.filter(
             current_stock__lte=F('reorder_level'),
             is_active=True
@@ -436,16 +473,13 @@ class InventoryReportView(APIView):
             is_active=True
         ).count()
         
-        # Expired products
         expired_products_count = Product.objects.filter(
             expiry_date__lt=timezone.now().date(),
             is_active=True
         ).count()
         
-        # Categories count
         categories_count = Category.objects.filter(is_active=True).count()
         
-        # Top selling products (most stock movements)
         top_selling = InventoryMovement.objects.filter(
             movement_type='SALE'
         ).values(
@@ -454,7 +488,6 @@ class InventoryReportView(APIView):
             total_sold=Sum('quantity')
         ).order_by('-total_sold')[:5]
         
-        # Low stock products
         low_stock_products = Product.objects.filter(
             current_stock__lte=F('reorder_level'),
             is_active=True

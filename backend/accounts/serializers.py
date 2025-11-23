@@ -1,10 +1,10 @@
 from rest_framework import serializers
 from django.contrib.auth import authenticate
-from .models import User, AuditLog
+from .models import User, AuditLog 
 
 
 class UserSerializer(serializers.ModelSerializer):
-    """Serializer for User model"""
+    """Serializer for User model (Read-only/Default)"""
     
     class Meta:
         model = User
@@ -37,11 +37,46 @@ class UserCreateSerializer(serializers.ModelSerializer):
 
 
 class UserUpdateSerializer(serializers.ModelSerializer):
-    """Serializer for updating user information"""
+    """Serializer for updating user information (used by Admin/Owner)"""
+    
+    password = serializers.CharField(write_only=True, required=False, min_length=8)
     
     class Meta:
         model = User
-        fields = ('email', 'full_name', 'phone', 'is_active')
+        fields = ('email', 'full_name', 'phone', 'is_active', 'role', 'password') 
+    
+    def update(self, instance, validated_data):
+        """Custom update logic to hash the password if it's provided."""
+        
+        password = validated_data.pop('password', None)
+        
+        if password:
+            instance.set_password(password)
+        
+        return super().update(instance, validated_data)
+
+
+# 🌟 NEW SERIALIZER FOR STAFF SELF-EDIT
+class UserSelfEditSerializer(serializers.ModelSerializer):
+    """Serializer for staff/user self-editing (profile update)"""
+    
+    password = serializers.CharField(write_only=True, required=False, min_length=8)
+    
+    class Meta:
+        model = User
+        # Restrict fields staff can change themselves
+        fields = ('email', 'full_name', 'phone', 'password') 
+        # Note: role and is_active are omitted
+    
+    def update(self, instance, validated_data):
+        """Custom update logic to hash the password if it's provided."""
+        
+        password = validated_data.pop('password', None)
+        
+        if password:
+            instance.set_password(password)
+        
+        return super().update(instance, validated_data)
 
 
 class ChangePasswordSerializer(serializers.Serializer):

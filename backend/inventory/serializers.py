@@ -1,3 +1,5 @@
+# inventory/serializers.py
+
 from rest_framework import serializers
 from .models import Category, Supplier, Product, InventoryMovement, LowStockAlert
 
@@ -9,7 +11,7 @@ class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
         fields = ('id', 'name', 'description', 'is_active', 'product_count', 
-                 'created_at', 'updated_at')
+                  'created_at', 'updated_at')
         read_only_fields = ('id', 'created_at', 'updated_at')
 
 
@@ -19,21 +21,45 @@ class SupplierSerializer(serializers.ModelSerializer):
     class Meta:
         model = Supplier
         fields = ('id', 'name', 'contact_person', 'phone', 'email', 'address', 
-                 'is_active', 'created_at', 'updated_at')
+                  'is_active', 'created_at', 'updated_at')
         read_only_fields = ('id', 'created_at', 'updated_at')
 
 
 class ProductListSerializer(serializers.ModelSerializer):
-    """Serializer for Product list view (minimal data)"""
+    """
+    Serializer for Product list view (minimal data).
+    """
     category_name = serializers.CharField(source='category.name', read_only=True)
     supplier_name = serializers.CharField(source='supplier.name', read_only=True)
     is_low_stock = serializers.ReadOnlyField()
+    image_url = serializers.SerializerMethodField()
     
     class Meta:
         model = Product
-        fields = ('id', 'sku', 'name', 'category', 'category_name', 'supplier_name',
-                 'unit_price', 'current_stock', 'reorder_level', 'is_low_stock', 
-                 'is_active', 'image')
+        fields = (
+            'id', 
+            'sku', 
+            'name', 
+            'category',
+            'category_name',
+            'supplier_name',
+            'unit_price',
+            'cost_price',
+            'current_stock',
+            'reorder_level', 
+            'is_low_stock', 
+            'is_active', 
+            'image',
+            'image_url'
+        )
+    
+    def get_image_url(self, obj):
+        """Get absolute URL for product image"""
+        if obj.image:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.image.url)
+        return None
 
 
 class ProductDetailSerializer(serializers.ModelSerializer):
@@ -41,6 +67,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
     supplier_name = serializers.CharField(source='supplier.name', read_only=True)
     created_by_name = serializers.CharField(source='created_by.full_name', read_only=True)
+    image_url = serializers.SerializerMethodField()
     
     # Computed fields
     is_low_stock = serializers.ReadOnlyField()
@@ -51,11 +78,20 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = ('id', 'sku', 'name', 'description', 'category', 'category_name',
-                 'supplier', 'supplier_name', 'unit_price', 'cost_price', 
-                 'current_stock', 'reorder_level', 'image', 'barcode', 'expiry_date',
-                 'is_active', 'is_low_stock', 'profit_margin', 'stock_value', 
-                 'is_expired', 'created_by', 'created_by_name', 'created_at', 'updated_at')
+                  'supplier', 'supplier_name', 'unit_price', 'cost_price', 
+                  'current_stock', 'reorder_level', 'image', 'image_url', 'barcode', 
+                  'expiry_date', 'is_active', 'is_low_stock', 'profit_margin', 
+                  'stock_value', 'is_expired', 'created_by', 'created_by_name', 
+                  'created_at', 'updated_at')
         read_only_fields = ('id', 'created_at', 'updated_at', 'created_by')
+    
+    def get_image_url(self, obj):
+        """Get absolute URL for product image"""
+        if obj.image:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.image.url)
+        return None
 
 
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
@@ -64,8 +100,8 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = ('sku', 'name', 'description', 'category', 'supplier', 
-                 'unit_price', 'cost_price', 'current_stock', 'reorder_level',
-                 'image', 'barcode', 'expiry_date', 'is_active')
+                  'unit_price', 'cost_price', 'current_stock', 'reorder_level',
+                  'image', 'barcode', 'expiry_date', 'is_active')
     
     def validate_unit_price(self, value):
         """Ensure unit price is positive"""
@@ -102,9 +138,9 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
     class Meta:
         model = InventoryMovement
         fields = ('id', 'product', 'product_name', 'product_sku', 'movement_type',
-                 'movement_type_display', 'quantity', 'stock_before', 'stock_after',
-                 'reference_number', 'reason', 'notes', 'transaction_id',
-                 'created_by', 'created_by_name', 'created_at')
+                  'movement_type_display', 'quantity', 'stock_before', 'stock_after',
+                  'reference_number', 'reason', 'notes', 'transaction_id',
+                  'created_by', 'created_by_name', 'created_at')
         read_only_fields = ('id', 'stock_before', 'stock_after', 'created_by', 'created_at')
 
 
@@ -114,7 +150,7 @@ class InventoryMovementCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = InventoryMovement
         fields = ('product', 'movement_type', 'quantity', 'reference_number', 
-                 'reason', 'notes')
+                  'reason', 'notes')
     
     def validate_quantity(self, value):
         """Ensure quantity is positive"""
@@ -156,11 +192,11 @@ class LowStockAlertSerializer(serializers.ModelSerializer):
     class Meta:
         model = LowStockAlert
         fields = ('id', 'product', 'product_name', 'product_sku', 'category_name',
-                 'current_stock', 'reorder_level', 'status', 'status_display',
-                 'created_at', 'acknowledged_at', 'acknowledged_by', 
-                 'acknowledged_by_name', 'resolved_at')
+                  'current_stock', 'reorder_level', 'status', 'status_display',
+                  'created_at', 'acknowledged_at', 'acknowledged_by', 
+                  'acknowledged_by_name', 'resolved_at')
         read_only_fields = ('id', 'product', 'current_stock', 'reorder_level',
-                           'created_at', 'acknowledged_at', 'acknowledged_by', 'resolved_at')
+                            'created_at', 'acknowledged_at', 'acknowledged_by', 'resolved_at')
 
 
 class InventoryReportSerializer(serializers.Serializer):

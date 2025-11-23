@@ -8,10 +8,19 @@ from datetime import timedelta
 from accounts.utils import create_audit_log
 from .models import SalesTransaction, TransactionItem, Cart, CartItem, PaymentTransaction
 from inventory.models import Product
+from django.db import transaction, DatabaseError 
+from rest_framework.exceptions import ValidationError
+import traceback 
+
 from .serializers import (
-    SalesTransactionListSerializer, SalesTransactionDetailSerializer,
-    SalesTransactionCreateSerializer, CartSerializer, CartItemSerializer,
-    AddToCartSerializer, VoidTransactionSerializer, PaymentTransactionSerializer,
+    SalesTransactionListSerializer, 
+    SalesTransactionDetailSerializer,
+    SalesTransactionCreateSerializer, 
+    CartSerializer, 
+    CartItemSerializer,
+    AddToCartSerializer, 
+    VoidTransactionSerializer, 
+    PaymentTransactionSerializer,
     SalesReportSerializer
 )
 
@@ -29,25 +38,18 @@ class SalesTransactionListCreateView(generics.ListCreateAPIView):
     def get_queryset(self):
         queryset = SalesTransaction.objects.select_related('created_by').all()
         
-        # Filter by status
         status_filter = self.request.query_params.get('status')
         if status_filter:
             queryset = queryset.filter(status=status_filter)
-        
-        # Filter by payment method
         payment_method = self.request.query_params.get('payment_method')
         if payment_method:
             queryset = queryset.filter(payment_method=payment_method)
-        
-        # Filter by date range
         start_date = self.request.query_params.get('start_date')
         end_date = self.request.query_params.get('end_date')
         if start_date:
             queryset = queryset.filter(created_at__gte=start_date)
         if end_date:
             queryset = queryset.filter(created_at__lte=end_date)
-        
-        # Filter by user (staff)
         user_id = self.request.query_params.get('user_id')
         if user_id:
             queryset = queryset.filter(created_by_id=user_id)
@@ -59,8 +61,23 @@ class SalesTransactionListCreateView(generics.ListCreateAPIView):
             return SalesTransactionCreateSerializer
         return SalesTransactionListSerializer
     
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        
+        if serializer.is_valid():
+            self.perform_create(serializer) 
+            headers = self.get_success_headers(serializer.data)
+            return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+        else:
+            print("\n🚨 SALES TRANSACTION LIST/CREATE SERIALIZER ERRORS (400 CAUSE):")
+            print("Incoming Data:", request.data)
+            print("Errors:", serializer.errors)
+            print("===============================================================")
+            
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
     def perform_create(self, serializer):
-        transaction = serializer.save()
+        transaction = serializer.save(created_by=self.request.user)
         
         create_audit_log(
             user=self.request.user,
@@ -102,7 +119,7 @@ class VoidTransactionView(APIView):
         serializer.is_valid(raise_exception=True)
         
         reason = serializer.validated_data['reason']
-        transaction.void_transaction(request.user, reason)
+        transaction.void_transaction(request.user, reason) 
         
         create_audit_log(
             user=request.user,
@@ -157,17 +174,20 @@ class AddToCartView(APIView):
         product_id = serializer.validated_data['product_id']
         quantity = serializer.validated_data['quantity']
         
-        # Get or create cart
         cart, created = Cart.objects.get_or_create(
             user=request.user,
             is_active=True,
             defaults={'session_id': f'CART-{request.user.id}-{timezone.now().timestamp()}'}
         )
         
-        # Get product
-        product = Product.objects.get(id=product_id)
+        try:
+            product = Product.objects.get(id=product_id)
+        except Product.DoesNotExist:
+            return Response(
+                {'error': 'Product not found'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
         
-        # Add or update cart item
         cart_item, created = CartItem.objects.get_or_create(
             cart=cart,
             product=product,
@@ -175,10 +195,8 @@ class AddToCartView(APIView):
         )
         
         if not created:
-            # Update quantity if item already exists
             new_quantity = cart_item.quantity + quantity
             
-            # Check stock availability
             if product.current_stock < new_quantity:
                 return Response(
                     {'error': f'Insufficient stock. Available: {product.current_stock}'},
@@ -219,7 +237,6 @@ class UpdateCartItemView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Check stock availability
         if cart_item.product.current_stock < quantity:
             return Response(
                 {'error': f'Insufficient stock. Available: {cart_item.product.current_stock}'},
@@ -262,107 +279,144 @@ class RemoveCartItemView(APIView):
 
 
 class CheckoutView(APIView):
-    """Process cart checkout"""
+    """
+    Processes checkout using the active cart.
+    ✅ FIXED: Transaction now creates as COMPLETED, ensuring immediate dashboard sync
+    """
     permission_classes = [IsAuthenticated]
     
+    @transaction.atomic
     def post(self, request):
         try:
-            cart = Cart.objects.prefetch_related('cart_items__product').get(
+            print("\n====================================")
+            print("INCOMING CHECKOUT PAYLOAD:")
+            print(request.data)
+            print("====================================")
+            
+            cart = Cart.objects.select_for_update().prefetch_related('cart_items__product').get(
                 user=request.user,
                 is_active=True
             )
+            
+            if not cart.cart_items.exists():
+                return Response(
+                    {'error': 'Cart is empty'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            transaction_data = {
+                'items': [
+                    {'product_id': item.product.id, 
+                     'quantity': item.quantity, 
+                     'unit_price': item.unit_price, 
+                     'discount': 0}
+                    for item in cart.cart_items.all()
+                ],
+                'payment_method': request.data.get('payment_method'),
+                'payment_reference': request.data.get('payment_reference', ''),
+                'amount_paid': request.data.get('amount_paid'),
+                'tax': request.data.get('tax', 0),
+                'discount': request.data.get('discount', 0),
+                'notes': request.data.get('notes', ''),
+                'customer_name': request.data.get('customer_name', ''),
+                'customer_phone': request.data.get('customer_phone', ''),
+                'customer_email': request.data.get('customer_email', '')
+            }
+            
+            serializer = SalesTransactionCreateSerializer(
+                data=transaction_data,
+                context={'request': request}
+            )
+            
+            if not serializer.is_valid():
+                print("\n🚨 CHECKOUT SERIALIZER VALIDATION ERRORS (400 CAUSE):")
+                print(serializer.errors)
+                print("=====================================================")
+                raise ValidationError(detail=serializer.errors) 
+            
+            # ✅ Transaction is now created with status='COMPLETED' (fixed in serializer)
+            transaction_obj = serializer.save(created_by=request.user)
+            
+            print(f"✅ Transaction created with status: {transaction_obj.status}")
+            
+            # Clear the cart and deactivate it
+            cart.clear()
+            cart.is_active = False
+            cart.save()
+            
+            create_audit_log(
+                user=request.user,
+                action='CREATE',
+                table_name='sales_transactions',
+                record_id=transaction_obj.id,
+                new_values=SalesTransactionDetailSerializer(transaction_obj).data,
+                request=request
+            )
+            
+            return Response({
+                'message': 'Checkout successful',
+                'transaction': SalesTransactionDetailSerializer(transaction_obj).data
+            }, status=status.HTTP_201_CREATED)
+
         except Cart.DoesNotExist:
             return Response(
-                {'error': 'No active cart found'},
+                {'error': 'Cart not found. Please ensure the user has an active cart.'},
                 status=status.HTTP_404_NOT_FOUND
             )
-        
-        if not cart.cart_items.exists():
+        except DatabaseError as e:
+            print("FATAL DATABASE ERROR DURING CHECKOUT:")
+            traceback.print_exc()
             return Response(
-                {'error': 'Cart is empty'},
+                {'error': 'A critical database error occurred. The transaction was rolled back. Please retry checkout.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        except ValidationError as e:
+            return Response(
+                {'error': 'Validation failed.', 'details': e.detail},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        # Build transaction data from cart
-        items = []
-        for cart_item in cart.cart_items.all():
-            items.append({
-                'product': cart_item.product.id,
-                'quantity': cart_item.quantity,
-                'unit_price': cart_item.unit_price,
-                'discount': 0
-            })
-        
-        transaction_data = {
-            'items': items,
-            'payment_method': request.data.get('payment_method'),
-            'payment_reference': request.data.get('payment_reference', ''),
-            'amount_paid': request.data.get('amount_paid'),
-            'tax': request.data.get('tax', 0),
-            'discount': request.data.get('discount', 0),
-            'notes': request.data.get('notes', ''),
-            'customer_name': request.data.get('customer_name', ''),
-            'customer_phone': request.data.get('customer_phone', ''),
-            'customer_email': request.data.get('customer_email', '')
-        }
-        
-        # Create transaction
-        serializer = SalesTransactionCreateSerializer(
-            data=transaction_data,
-            context={'request': request}
-        )
-        serializer.is_valid(raise_exception=True)
-        transaction = serializer.save()
-        
-        # Clear cart
-        cart.clear()
-        cart.is_active = False
-        cart.save()
-        
-        return Response({
-            'message': 'Checkout successful',
-            'transaction': SalesTransactionDetailSerializer(transaction).data
-        }, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            error_detail = getattr(e, 'detail', str(e))
+            error_message = f'Server error during transaction processing: {error_detail}'
+            print(f"UNHANDLED EXCEPTION IN CHECKOUT: {error_message}")
+            traceback.print_exc()
+            return Response(
+                {'error': error_message},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
-# ========== SALES REPORTS ==========
+# ========== SALES REPORTS VIEWS ==========
 
 class SalesReportView(APIView):
     """Get comprehensive sales report"""
     permission_classes = [IsAuthenticated]
     
     def get(self, request):
-        # Date range (default to last 30 days)
         end_date = timezone.now()
         start_date = end_date - timedelta(days=30)
         
-        # Allow custom date range
         if request.query_params.get('start_date'):
             start_date = timezone.datetime.fromisoformat(request.query_params.get('start_date'))
         if request.query_params.get('end_date'):
             end_date = timezone.datetime.fromisoformat(request.query_params.get('end_date'))
         
-        # Get completed transactions in date range
         transactions = SalesTransaction.objects.filter(
             status='COMPLETED',
             created_at__gte=start_date,
             created_at__lte=end_date
         )
         
-        # Calculate totals
         total_sales = transactions.aggregate(total=Sum('total_amount'))['total'] or 0
         total_transactions = transactions.count()
         total_items_sold = TransactionItem.objects.filter(
             transaction__in=transactions
         ).aggregate(total=Sum('quantity'))['total'] or 0
         
-        # Calculate profit
         total_profit = sum(t.profit for t in transactions)
         
-        # Average transaction
         average_transaction = total_sales / total_transactions if total_transactions > 0 else 0
         
-        # Sales by payment method
         cash_sales = transactions.filter(payment_method='CASH').aggregate(
             total=Sum('total_amount'))['total'] or 0
         card_sales = transactions.filter(payment_method='CARD').aggregate(
@@ -371,7 +425,6 @@ class SalesReportView(APIView):
             payment_method__in=['GCASH', 'PAYMAYA', 'BANK_TRANSFER']
         ).aggregate(total=Sum('total_amount'))['total'] or 0
         
-        # Top selling products
         top_products = TransactionItem.objects.filter(
             transaction__in=transactions
         ).values(
@@ -381,7 +434,6 @@ class SalesReportView(APIView):
             total_sales=Sum('line_total')
         ).order_by('-total_quantity')[:10]
         
-        # Daily sales breakdown
         daily_sales = transactions.extra(
             select={'day': 'DATE(created_at)'}
         ).values('day').annotate(
@@ -436,7 +488,6 @@ class StaffSalesView(APIView):
     permission_classes = [IsAuthenticated]
     
     def get(self, request):
-        # Date range (default to today)
         start_date = request.query_params.get('start_date', timezone.now().date())
         end_date = request.query_params.get('end_date', timezone.now().date())
         

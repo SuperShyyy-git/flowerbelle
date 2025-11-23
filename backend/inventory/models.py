@@ -1,11 +1,7 @@
 from django.db import models
 from django.core.validators import MinValueValidator
 from django.utils import timezone
-from accounts.models import User
-
-
-
-
+from django.db.models import F
 
 class Category(models.Model):
     """Product categories (Roses, Tulips, Arrangements, etc.)"""
@@ -66,9 +62,19 @@ class Product(models.Model):
     cost_price = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
     
     # Stock management
-    current_stock = models.IntegerField(default=0, validators=[MinValueValidator(0)])
-    reorder_level = models.IntegerField(default=10, validators=[MinValueValidator(0)], 
-                                       help_text='Alert when stock falls below this level')
+    current_stock = models.IntegerField(
+        default=0, 
+        validators=[MinValueValidator(0)], 
+        blank=True, 
+        null=True   
+    )
+    reorder_level = models.IntegerField(
+        default=10, 
+        validators=[MinValueValidator(0)], 
+        blank=True, 
+        null=True,  
+        help_text='Alert when stock falls below this level'
+    )
     
     # Product details
     image = models.ImageField(upload_to='products/', null=True, blank=True)
@@ -76,10 +82,10 @@ class Product(models.Model):
     expiry_date = models.DateField(null=True, blank=True, help_text='For perishable items')
     
     # Status
-    is_active = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='created_products')
+    created_by = models.ForeignKey('accounts.User', on_delete=models.SET_NULL, null=True, related_name='created_products') 
     
     class Meta:
         db_table = 'products'
@@ -132,7 +138,7 @@ class InventoryMovement(models.Model):
         ('DAMAGE', 'Damage/Wastage'),
     )
     
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='movements')
+    product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='movements')
     movement_type = models.CharField(max_length=20, choices=MOVEMENT_TYPES)
     quantity = models.IntegerField(validators=[MinValueValidator(1)])
     
@@ -146,7 +152,7 @@ class InventoryMovement(models.Model):
     notes = models.TextField(blank=True)
     
     # Tracking
-    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='inventory_movements')
+    created_by = models.ForeignKey('accounts.User', on_delete=models.SET_NULL, null=True, related_name='inventory_movements')
     created_at = models.DateTimeField(auto_now_add=True)
     
     # Link to sales transaction if movement is from a sale
@@ -166,21 +172,44 @@ class InventoryMovement(models.Model):
         return f"{self.get_movement_type_display()} - {self.product.name} ({self.quantity})"
     
     def save(self, *args, **kwargs):
-        """Update product stock when movement is saved"""
+        """
+        ⚠️ NOTE: For SALE movements, stock updates and alert creation 
+        are now handled in pos/serializers.py for better transaction control.
+        
+        This save() method now only handles manual inventory movements 
+        (STOCK_IN, STOCK_OUT, ADJUSTMENT, DAMAGE).
+        """
+        
         if not self.pk:  # Only on creation
-            self.stock_before = self.product.current_stock
             
-            # Adjust stock based on movement type
-            if self.movement_type in ['STOCK_IN', 'RETURN']:
-                self.product.current_stock += self.quantity
-            elif self.movement_type in ['STOCK_OUT', 'SALE', 'DAMAGE']:
-                self.product.current_stock -= self.quantity
-            elif self.movement_type == 'ADJUSTMENT':
-                # Adjustment can be positive or negative
-                self.product.current_stock = self.quantity
-            
-            self.stock_after = self.product.current_stock
-            self.product.save()
+            # Only process non-SALE movements here
+            # SALE movements are created with pre-calculated stock_before/stock_after
+            if self.movement_type != 'SALE' and not (self.stock_before is not None and self.stock_after is not None):
+                self.stock_before = self.product.current_stock
+                
+                if self.movement_type in ['STOCK_IN']:
+                    Product.objects.filter(pk=self.product.pk).update(current_stock=F('current_stock') + self.quantity)
+                elif self.movement_type in ['STOCK_OUT', 'DAMAGE']:
+                    Product.objects.filter(pk=self.product.pk).update(current_stock=F('current_stock') - self.quantity)
+                elif self.movement_type == 'ADJUSTMENT':
+                    Product.objects.filter(pk=self.product.pk).update(current_stock=self.quantity)
+                
+                self.product.refresh_from_db()
+                self.stock_after = self.product.current_stock
+                
+                # Create low stock alert for manual movements
+                if self.product.is_low_stock and self.movement_type in ['STOCK_OUT', 'DAMAGE', 'ADJUSTMENT']:
+                    existing_alert = LowStockAlert.objects.filter(
+                        product=self.product,
+                        status='PENDING'
+                    ).first()
+                    
+                    if not existing_alert:
+                        LowStockAlert.objects.create(
+                            product=self.product,
+                            current_stock=self.product.current_stock,
+                            reorder_level=self.product.reorder_level
+                        )
         
         super().save(*args, **kwargs)
 
@@ -194,14 +223,14 @@ class LowStockAlert(models.Model):
         ('RESOLVED', 'Resolved'),
     )
     
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='alerts')
+    product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='alerts')
     current_stock = models.IntegerField()
     reorder_level = models.IntegerField()
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
     
     created_at = models.DateTimeField(auto_now_add=True)
     acknowledged_at = models.DateTimeField(null=True, blank=True)
-    acknowledged_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='acknowledged_alerts')
+    acknowledged_by = models.ForeignKey('accounts.User', on_delete=models.SET_NULL, null=True, blank=True, related_name='acknowledged_alerts')
     resolved_at = models.DateTimeField(null=True, blank=True)
     
     class Meta:
@@ -217,9 +246,9 @@ class LowStockAlert(models.Model):
         # Auto-fill current_stock from Product if not manually set
         if not self.current_stock and self.product:
             try:
-                self.current_stock = self.product.stock_quantity
+                self.current_stock = self.product.current_stock 
             except AttributeError:
-                self.current_stock = 0  # fallback if product has no stock_quantity attribute
+                self.current_stock = 0
         super().save(*args, **kwargs)
     
     def acknowledge(self, user):

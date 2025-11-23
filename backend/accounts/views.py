@@ -3,14 +3,16 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import update_session_auth_hash
-from django.utils import timezone  # MOVED TO TOP
+from django.utils import timezone 
+from django.db.models import ProtectedError # <--- CRITICAL IMPORT FOR FIX
 from .models import User, AuditLog
 from .serializers import (
     UserSerializer, UserCreateSerializer, UserUpdateSerializer,
-    ChangePasswordSerializer, LoginSerializer, AuditLogSerializer
+    ChangePasswordSerializer, LoginSerializer, AuditLogSerializer,
+    UserSelfEditSerializer
 )
-from .permissions import IsOwner
-from .utils import create_audit_log
+from .permissions import IsOwner, IsUserAdmin
+from .utils import create_audit_log 
 
 
 class LoginView(APIView):
@@ -61,27 +63,46 @@ class LogoutView(APIView):
         return Response({'message': 'Logged out successfully'}, status=status.HTTP_200_OK)
 
 
-class CurrentUserView(APIView):
-    """Get current authenticated user details"""
+class CurrentUserView(generics.RetrieveUpdateAPIView): 
+    """Get or update current authenticated user details (Staff Self-Edit)"""
     permission_classes = [permissions.IsAuthenticated]
     
-    def get(self, request):
-        serializer = UserSerializer(request.user)
-        return Response(serializer.data)
+    def get_object(self):
+        return self.request.user
+
+    def get_serializer_class(self):
+        if self.request.method in ['PUT', 'PATCH']:
+            return UserSelfEditSerializer 
+        return UserSerializer
+    
+    def perform_update(self, serializer):
+        old_data = UserSerializer(self.get_object()).data
+        user = serializer.save()
+        
+        create_audit_log(
+            user=self.request.user,
+            action='UPDATE',
+            table_name='users',
+            record_id=user.id,
+            old_values=old_data,
+            new_values=UserSerializer(user).data,
+            description="Staff self-edited profile",
+            request=self.request
+        )
 
 
 class UserListCreateView(generics.ListCreateAPIView):
-    """List all users or create a new user (Owner only)"""
+    """List all users or create a new user (Admin/Owner only)"""
     queryset = User.objects.all()
-    permission_classes = [permissions.IsAuthenticated, IsOwner]
+    permission_classes = [permissions.IsAuthenticated, IsUserAdmin] 
     
     def get_serializer_class(self):
         if self.request.method == 'POST':
             return UserCreateSerializer
-        return UserSerializer
+        return UserSerializer 
     
     def perform_create(self, serializer):
-        user = serializer.save()
+        user = serializer.save() 
         
         create_audit_log(
             user=self.request.user,
@@ -94,9 +115,9 @@ class UserListCreateView(generics.ListCreateAPIView):
 
 
 class UserDetailView(generics.RetrieveUpdateDestroyAPIView):
-    """Retrieve, update or delete a user (Owner only)"""
+    """Retrieve, update or delete a user (Admin/Owner only)"""
     queryset = User.objects.all()
-    permission_classes = [permissions.IsAuthenticated, IsOwner]
+    permission_classes = [permissions.IsAuthenticated, IsUserAdmin] 
     
     def get_serializer_class(self):
         if self.request.method in ['PUT', 'PATCH']:
@@ -117,17 +138,53 @@ class UserDetailView(generics.RetrieveUpdateDestroyAPIView):
             request=self.request
         )
     
+    # --- UPDATED DELETE LOGIC STARTS HERE ---
+    def destroy(self, request, *args, **kwargs):
+        try:
+            instance = self.get_object()
+
+            # 1. Prevent deleting yourself
+            if instance == request.user:
+                return Response(
+                    {"detail": "You cannot delete your own account."}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # 2. Attempt the Hard Delete
+            # This triggers instance.delete()
+            self.perform_destroy(instance)
+            
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        except ProtectedError:
+            # 3. CATCH FOREIGN KEY ERROR
+            # This runs if the user has Sales, Inventory, or Logs attached
+            return Response(
+                {"detail": "Cannot delete user: They have existing Sales or Inventory records. Please keep them as Inactive instead to preserve history."}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            # 4. Catch any other unexpected errors
+            return Response(
+                {"detail": str(e)}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
     def perform_destroy(self, instance):
-        # Soft delete - deactivate instead of deleting
-        instance.is_active = False
-        instance.save()
+        # We actually delete the record here.
+        # If it fails due to DB constraints, the 'destroy' method above catches it.
+        user_id = instance.id
+        username = instance.username
         
+        instance.delete()
+        
+        # Log the deletion
         create_audit_log(
             user=self.request.user,
             action='DELETE',
             table_name='users',
-            record_id=instance.id,
-            description=f"Deactivated user: {instance.username}",
+            record_id=user_id,
+            description=f"Permanently deleted user: {username}",
             request=self.request
         )
 
@@ -169,7 +226,7 @@ class AuditLogListView(generics.ListAPIView):
     """List all audit logs (Owner only)"""
     queryset = AuditLog.objects.all()
     serializer_class = AuditLogSerializer
-    permission_classes = [permissions.IsAuthenticated, IsOwner]
+    permission_classes = [permissions.IsAuthenticated, IsOwner] 
     
     def get_queryset(self):
         """Filter by user if user_id is provided"""
